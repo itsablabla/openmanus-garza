@@ -10,4 +10,6 @@ COPY . .
 
 RUN uv pip install --system -r requirements.txt
 
-CMD ["bash"]
+RUN chmod +x entrypoint.sh
+
+CMD ["./entrypoint.sh"]
