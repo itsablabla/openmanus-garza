@@ -1169,8 +1169,15 @@ async def manus_cost_summary(
 # garza_status — Sprint 2: LLM summarization + runaway task warning
 # ---------------------------------------------------------------------------
 
-_RUNAWAY_MINUTES = int(os.environ.get("GARZA_RUNAWAY_MINUTES", "30"))
-_RUNAWAY_CREDITS = int(os.environ.get("GARZA_RUNAWAY_CREDITS", "10"))
+def _safe_int(val, default):
+    """Parse int from env var, falling back to default if value is non-numeric."""
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
+_RUNAWAY_MINUTES = _safe_int(os.environ.get("GARZA_RUNAWAY_MINUTES"), 30)
+_RUNAWAY_CREDITS = _safe_int(os.environ.get("GARZA_RUNAWAY_CREDITS"), 10)
 
 
 @mcp.tool()
