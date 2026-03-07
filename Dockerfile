@@ -17,6 +17,11 @@ COPY . .
 # Install Python dependencies
 RUN uv pip install --system -r requirements.txt
 
+# Install Daytona stub package (satisfies imports without real Daytona SDK)
+# The real Daytona SDK is not on PyPI; this stub allows all agents to load.
+# Sandbox operations will raise NotImplementedError if called without a real key.
+RUN pip install --no-cache-dir ./daytona_stub/
+
 # Install Playwright Chromium browser binaries
 RUN playwright install chromium
 
