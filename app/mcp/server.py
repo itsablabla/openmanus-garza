@@ -1,180 +1,323 @@
-import logging
-import sys
+"""
+Hybrid MCP Server for GARZA OS — OpenManus + Manus API.
 
+Synchronous layer  : bash, browser, editor, terminate (OpenManus local agents)
+Asynchronous layer : manus_create_task, manus_get_task, manus_list_tasks,
+                     manus_upload_file, manus_list_files, manus_create_webhook
+                     (Manus SaaS API — fire-and-forget, poll for results)
+"""
 
-logging.basicConfig(level=logging.INFO, handlers=[logging.StreamHandler(sys.stderr)])
-
-import argparse
 import asyncio
-import atexit
-import json
-from inspect import Parameter, Signature
-from typing import Any, Dict, Optional
-
+import logging
+import os
 from mcp.server.fastmcp import FastMCP
+from app.mcp.manus_client import handle_api_error, manus_request
+from app.mcp.manus_models import (
+    CreateTaskInput,
+    CreateWebhookInput,
+    GetTaskInput,
+    ListTasksInput,
+)
 
-from app.logger import logger
-from app.tool.base import BaseTool
-from app.tool.bash import Bash
-from app.tool.browser_use_tool import BrowserUseTool
-from app.tool.str_replace_editor import StrReplaceEditor
-from app.tool.terminate import Terminate
+logger = logging.getLogger(__name__)
+mcp = FastMCP("OpenManus Hybrid MCP Server")
 
 
-class MCPServer:
-    """MCP Server implementation with tool registration and management."""
+# ---------------------------------------------------------------------------
+# Synchronous tools (existing OpenManus agents — unchanged from upstream)
+# ---------------------------------------------------------------------------
 
-    def __init__(self, name: str = "openmanus"):
-        self.server = FastMCP(name)
-        self.tools: Dict[str, BaseTool] = {}
+@mcp.tool()
+async def bash(command: str) -> str:
+    """Execute a bash command and return its output."""
+    proc = await asyncio.create_subprocess_shell(
+        command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    stdout, _ = await proc.communicate()
+    return stdout.decode(errors="replace")
 
-        # Initialize standard tools
-        self.tools["bash"] = Bash()
-        self.tools["browser"] = BrowserUseTool()
-        self.tools["editor"] = StrReplaceEditor()
-        self.tools["terminate"] = Terminate()
 
-    def register_tool(self, tool: BaseTool, method_name: Optional[str] = None) -> None:
-        """Register a tool with parameter validation and documentation."""
-        tool_name = method_name or tool.name
-        tool_param = tool.to_param()
-        tool_function = tool_param["function"]
+@mcp.tool()
+async def editor(command: str, path: str, content: str = "") -> str:
+    """Read or write a file. command: 'view' | 'create' | 'str_replace'."""
+    if command == "view":
+        try:
+            return open(path).read()
+        except FileNotFoundError:
+            return f"File not found: {path}"
+    elif command == "create":
+        import pathlib
+        pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
+            f.write(content)
+        return f"File written: {path}"
+    return f"Unknown editor command: {command}"
 
-        # Define the async function to be registered
-        async def tool_method(**kwargs):
-            logger.info(f"Executing {tool_name}: {kwargs}")
-            result = await tool.execute(**kwargs)
 
-            logger.info(f"Result of {tool_name}: {result}")
+@mcp.tool()
+async def terminate(reason: str = "") -> str:
+    """Signal task completion to the orchestrator."""
+    return f"Task terminated. Reason: {reason}"
 
-            # Handle different types of results (match original logic)
-            if hasattr(result, "model_dump"):
-                return json.dumps(result.model_dump())
-            elif isinstance(result, dict):
-                return json.dumps(result)
-            return result
 
-        # Set method metadata
-        tool_method.__name__ = tool_name
-        tool_method.__doc__ = self._build_docstring(tool_function)
-        tool_method.__signature__ = self._build_signature(tool_function)
+# ---------------------------------------------------------------------------
+# Asynchronous tools (Manus SaaS API)
+# ---------------------------------------------------------------------------
 
-        # Store parameter schema (important for tools that access it programmatically)
-        param_props = tool_function.get("parameters", {}).get("properties", {})
-        required_params = tool_function.get("parameters", {}).get("required", [])
-        tool_method._parameter_schema = {
-            param_name: {
-                "description": param_details.get("description", ""),
-                "type": param_details.get("type", "any"),
-                "required": param_name in required_params,
-            }
-            for param_name, param_details in param_props.items()
+@mcp.tool()
+async def manus_create_task(
+    prompt: str,
+    task_mode: str = "agent",
+    agent_profile: str = "speed",
+    file_ids: str = "",
+    use_gmail_connector: bool = False,
+    use_notion_connector: bool = False,
+    use_gcal_connector: bool = False,
+) -> str:
+    """
+    Submit a long-running task to Manus AI for autonomous execution.
+
+    Returns a task_id — poll with manus_get_task until status == 'completed'.
+    Tasks typically complete in 2-10 minutes.
+
+    Args:
+        prompt: Natural language task description (10-10,000 chars)
+        task_mode: agent (default, full autonomous), adaptive, or chat
+        agent_profile: speed (default, ~100 credits) or quality (~200 credits, Manus 1.6 Max)
+        file_ids: Comma-separated file IDs from manus_upload_file (optional)
+        use_gmail_connector: Grant Manus access to Gmail
+        use_notion_connector: Grant Manus access to Notion
+        use_gcal_connector: Grant Manus access to Google Calendar
+    """
+    try:
+        body: dict = {
+            "prompt": prompt,
+            "task_mode": task_mode,
+            "agent_profile": agent_profile,
         }
 
-        # Register with server
-        self.server.tool()(tool_method)
-        logger.info(f"Registered tool: {tool_name}")
+        if file_ids:
+            body["file_ids"] = [fid.strip() for fid in file_ids.split(",") if fid.strip()]
 
-    def _build_docstring(self, tool_function: dict) -> str:
-        """Build a formatted docstring from tool function metadata."""
-        description = tool_function.get("description", "")
-        param_props = tool_function.get("parameters", {}).get("properties", {})
-        required_params = tool_function.get("parameters", {}).get("required", [])
+        connectors = []
+        connector_map = {
+            use_gmail_connector: "MANUS_GMAIL_CONNECTOR_ID",
+            use_notion_connector: "MANUS_NOTION_CONNECTOR_ID",
+            use_gcal_connector: "MANUS_GCAL_CONNECTOR_ID",
+        }
+        for enabled, env_var in connector_map.items():
+            if enabled:
+                cid = os.environ.get(env_var, "")
+                if cid:
+                    connectors.append({"id": cid})
+                else:
+                    logger.warning("[manus] %s env var not set — connector skipped", env_var)
+        if connectors:
+            body["connectors"] = connectors
 
-        # Build docstring (match original format)
-        docstring = description
-        if param_props:
-            docstring += "\n\nParameters:\n"
-            for param_name, param_details in param_props.items():
-                required_str = (
-                    "(required)" if param_name in required_params else "(optional)"
-                )
-                param_type = param_details.get("type", "any")
-                param_desc = param_details.get("description", "")
-                docstring += (
-                    f"    {param_name} ({param_type}) {required_str}: {param_desc}\n"
-                )
+        result = await manus_request("POST", "/tasks", json=body)
+        task_id = result.get("id", result.get("task_id", "unknown"))
+        status = result.get("status", "pending")
 
-        return docstring
+        return (
+            f"Task created successfully.\n"
+            f"task_id : {task_id}\n"
+            f"status  : {status}\n"
+            f"Tip     : Call manus_get_task(task_id='{task_id}') in 2-3 minutes to check progress."
+        )
+    except Exception as e:
+        return handle_api_error(e)
 
-    def _build_signature(self, tool_function: dict) -> Signature:
-        """Build a function signature from tool function metadata."""
-        param_props = tool_function.get("parameters", {}).get("properties", {})
-        required_params = tool_function.get("parameters", {}).get("required", [])
 
-        parameters = []
+@mcp.tool()
+async def manus_get_task(task_id: str) -> str:
+    """
+    Poll the status and output of a Manus task.
 
-        # Follow original type mapping
-        for param_name, param_details in param_props.items():
-            param_type = param_details.get("type", "")
-            default = Parameter.empty if param_name in required_params else None
+    Args:
+        task_id: The task ID returned by manus_create_task
+    """
+    try:
+        result = await manus_request("GET", f"/tasks/{task_id}")
+        status = result.get("status", "unknown")
+        output = result.get("output") or result.get("result") or ""
+        artifacts = result.get("artifacts", [])
+        credits_used = result.get("credits_used")
+        error_msg = result.get("error_message") or result.get("error") or ""
 
-            # Map JSON Schema types to Python types (same as original)
-            annotation = Any
-            if param_type == "string":
-                annotation = str
-            elif param_type == "integer":
-                annotation = int
-            elif param_type == "number":
-                annotation = float
-            elif param_type == "boolean":
-                annotation = bool
-            elif param_type == "object":
-                annotation = dict
-            elif param_type == "array":
-                annotation = list
+        lines = [
+            f"task_id     : {task_id}",
+            f"status      : {status}",
+        ]
+        if credits_used is not None:
+            lines.append(f"credits_used: {credits_used}")
+        if output:
+            lines.append(f"\nOutput:\n{output}")
+        if artifacts:
+            lines.append(f"\nArtifacts ({len(artifacts)}):")
+            for a in artifacts[:10]:
+                lines.append(f"  - {a.get('name', 'file')} → {a.get('url', '(no url)')}")
+        if error_msg:
+            lines.append(f"\nError: {error_msg}")
+        if status in ("pending", "running"):
+            lines.append("\nTip: Task still in progress — check again in 1-2 minutes.")
 
-            # Create parameter with same structure as original
-            param = Parameter(
-                name=param_name,
-                kind=Parameter.KEYWORD_ONLY,
-                default=default,
-                annotation=annotation,
+        return "\n".join(lines)
+    except Exception as e:
+        return handle_api_error(e)
+
+
+@mcp.tool()
+async def manus_list_tasks(
+    limit: int = 20,
+    offset: int = 0,
+    status_filter: str = "",
+) -> str:
+    """
+    List recent Manus tasks with pagination.
+
+    Args:
+        limit: Number of tasks to return (1-100, default 20)
+        offset: Pagination offset (default 0)
+        status_filter: Optional filter — pending | running | completed | failed
+    """
+    try:
+        params: dict = {"limit": limit, "offset": offset}
+        if status_filter:
+            params["status"] = status_filter
+
+        result = await manus_request("GET", "/tasks", params=params)
+        tasks = result.get("tasks", result.get("data", []))
+        has_more = result.get("has_more", False)
+        next_offset = result.get("next_offset", offset + len(tasks))
+
+        if not tasks:
+            return "No tasks found."
+
+        lines = [f"Tasks ({len(tasks)} returned, offset={offset}):"]
+        for t in tasks:
+            tid = t.get("id", t.get("task_id", "?"))
+            tstatus = t.get("status", "?")
+            created = t.get("created_at", "")[:19]
+            prompt_preview = (t.get("prompt", "") or "")[:60]
+            lines.append(f"  {tid}  [{tstatus}]  {created}  {prompt_preview!r}")
+
+        if has_more:
+            lines.append(f"\nMore tasks available — call with offset={next_offset}")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return handle_api_error(e)
+
+
+@mcp.tool()
+async def manus_upload_file(filename: str, content_base64: str, content_type: str = "text/plain") -> str:
+    """
+    Upload a file to Manus and get a file_id for use in manus_create_task.
+
+    Args:
+        filename: Name of the file (e.g., 'report.pdf')
+        content_base64: Base64-encoded file content
+        content_type: MIME type (default text/plain)
+    """
+    try:
+        import base64
+        import httpx
+
+        # Step 1: Get presigned upload URL
+        presign = await manus_request("POST", "/files", json={
+            "filename": filename,
+            "content_type": content_type,
+        })
+        upload_url = presign.get("upload_url")
+        file_id = presign.get("id") or presign.get("file_id")
+
+        if not upload_url or not file_id:
+            return f"Error: Unexpected presign response — {presign}"
+
+        # Step 2: Upload via PUT
+        raw_bytes = base64.b64decode(content_base64)
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            put_resp = await client.put(
+                upload_url,
+                content=raw_bytes,
+                headers={"Content-Type": content_type},
             )
-            parameters.append(param)
+            put_resp.raise_for_status()
 
-        return Signature(parameters=parameters)
-
-    async def cleanup(self) -> None:
-        """Clean up server resources."""
-        logger.info("Cleaning up resources")
-        # Follow original cleanup logic - only clean browser tool
-        if "browser" in self.tools and hasattr(self.tools["browser"], "cleanup"):
-            await self.tools["browser"].cleanup()
-
-    def register_all_tools(self) -> None:
-        """Register all tools with the server."""
-        for tool in self.tools.values():
-            self.register_tool(tool)
-
-    def run(self, transport: str = "stdio") -> None:
-        """Run the MCP server."""
-        # Register all tools
-        self.register_all_tools()
-
-        # Register cleanup function (match original behavior)
-        atexit.register(lambda: asyncio.run(self.cleanup()))
-
-        # Start server (with same logging as original)
-        logger.info(f"Starting OpenManus server ({transport} mode)")
-        self.server.run(transport=transport)
+        return (
+            f"File uploaded successfully.\n"
+            f"file_id  : {file_id}\n"
+            f"filename : {filename}\n"
+            f"Tip      : Pass file_ids='{file_id}' when calling manus_create_task."
+        )
+    except Exception as e:
+        return handle_api_error(e)
 
 
-def parse_args() -> argparse.Namespace:
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="OpenManus MCP Server")
-    parser.add_argument(
-        "--transport",
-        choices=["stdio"],
-        default="stdio",
-        help="Communication method: stdio or http (default: stdio)",
-    )
-    return parser.parse_args()
+@mcp.tool()
+async def manus_list_files(limit: int = 20, offset: int = 0) -> str:
+    """
+    List files uploaded to Manus.
+
+    Args:
+        limit: Number of files to return (default 20)
+        offset: Pagination offset (default 0)
+    """
+    try:
+        result = await manus_request("GET", "/files", params={"limit": limit, "offset": offset})
+        files = result.get("files", result.get("data", []))
+
+        if not files:
+            return "No files found."
+
+        lines = [f"Files ({len(files)}):"]
+        for f in files:
+            fid = f.get("id", "?")
+            name = f.get("filename") or f.get("name", "?")
+            size = f.get("size", "?")
+            created = (f.get("created_at") or "")[:19]
+            lines.append(f"  {fid}  {name}  {size} bytes  {created}")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return handle_api_error(e)
 
 
-if __name__ == "__main__":
-    args = parse_args()
+@mcp.tool()
+async def manus_create_webhook(
+    url: str,
+    events: str = "task.completed,task.failed",
+) -> str:
+    """
+    Register a webhook to receive Manus task completion events.
 
-    # Create and run server (maintaining original flow)
-    server = MCPServer()
-    server.run(transport=args.transport)
+    Use your n8n webhook trigger URL so GARZA OS is notified automatically
+    when long-running tasks finish — no polling required.
+
+    Args:
+        url: Webhook endpoint URL (e.g., your n8n webhook trigger URL)
+        events: Comma-separated events (default: task.completed,task.failed)
+    """
+    try:
+        event_list = [e.strip() for e in events.split(",") if e.strip()]
+        result = await manus_request("POST", "/webhooks", json={
+            "url": url,
+            "events": event_list,
+        })
+        webhook_id = result.get("id") or result.get("webhook_id", "unknown")
+        secret = result.get("secret", "(none)")
+
+        return (
+            f"Webhook registered.\n"
+            f"webhook_id : {webhook_id}\n"
+            f"url        : {url}\n"
+            f"events     : {event_list}\n"
+            f"secret     : {secret}\n"
+            f"Tip        : Store the secret in Railway env as MANUS_WEBHOOK_SECRET "
+            f"and verify it in your n8n workflow."
+        )
+    except Exception as e:
+        return handle_api_error(e)
