@@ -1,24 +1,29 @@
 # coding: utf-8
 """
 Entry point for the OpenManus Hybrid MCP Server.
-Launches the FastMCP server using SSE transport so Railway can serve
-HTTP connections from Claude Desktop and other MCP clients.
-
-Explicitly sets host=0.0.0.0 and port from PORT env var (Railway standard)
-to ensure the server binds on the public interface regardless of mcp version.
+Launches the FastMCP server using SSE transport via uvicorn directly,
+with proxy headers support for Railway's reverse proxy.
 """
+import asyncio
 import os
 
 if __name__ == "__main__":
-    # Import the FastMCP app from the hybrid server module
+    import uvicorn
     from app.mcp.server import mcp
 
-    # Override host/port settings directly on the mcp object.
-    # Railway injects PORT env var; FastMCP defaults to 127.0.0.1:8000 which
-    # is unreachable from outside the container.
     port = int(os.environ.get("PORT", os.environ.get("FASTMCP_PORT", "8080")))
-    mcp.settings.host = "0.0.0.0"
-    mcp.settings.port = port
+    host = "0.0.0.0"
 
-    print(f"[run_mcp_server] Starting SSE on 0.0.0.0:{port}", flush=True)
-    mcp.run(transport="sse")
+    print(f"[run_mcp_server] Starting SSE on {host}:{port}", flush=True)
+
+    # Get the Starlette app from FastMCP (includes custom_route endpoints)
+    starlette_app = mcp.sse_app()
+
+    uvicorn.run(
+        starlette_app,
+        host=host,
+        port=port,
+        proxy_headers=True,          # Trust X-Forwarded-* headers from Railway
+        forwarded_allow_ips="*",     # Allow all IPs to set forwarded headers
+        log_level="info",
+    )
