@@ -3,14 +3,35 @@ AgentTool: Wraps any OpenManus agent as a stateless, MCP-compatible tool.
 
 Each call creates a fresh agent instance, runs it to completion, and cleans up.
 This ensures thread safety and predictable concurrent operation.
+
+Key design decision: `parameters` is a plain dict field (not a @property) so
+that Pydantic's to_param() correctly serializes it instead of returning the
+property descriptor object. Using @property causes Pydantic to return the
+descriptor itself rather than calling it, resulting in:
+  AttributeError: 'property' object has no attribute 'get'
 """
 import asyncio
-from typing import Any, Type
+from typing import Any, Optional, Type
 
 from pydantic import Field
 
 from app.logger import logger
 from app.tool.base import BaseTool, ToolResult
+
+# The parameters schema for all AgentTool instances — a single string prompt.
+_AGENT_TOOL_PARAMETERS = {
+    "type": "object",
+    "properties": {
+        "prompt": {
+            "type": "string",
+            "description": (
+                "The natural language task description for the agent to execute. "
+                "Be as specific and detailed as possible."
+            ),
+        }
+    },
+    "required": ["prompt"],
+}
 
 
 class AgentTool(BaseTool):
@@ -21,8 +42,16 @@ class AgentTool(BaseTool):
     isolation between requests. This is the "Agent-as-a-Tool" pattern.
     """
 
+    # Store agent_class as a plain field (not Pydantic-managed) to avoid
+    # issues with non-serializable types.
     agent_class: Any = Field(default=None, exclude=True)
     agent_config: dict = Field(default_factory=dict, exclude=True)
+
+    # parameters MUST be a plain dict field (NOT a @property) so that
+    # BaseTool.to_param() serializes it correctly via self.parameters.
+    # Pydantic returns the property descriptor object instead of calling it,
+    # which breaks the MCP server's docstring/signature building.
+    parameters: dict = Field(default_factory=lambda: _AGENT_TOOL_PARAMETERS.copy())
 
     class Config:
         arbitrary_types_allowed = True
@@ -42,25 +71,11 @@ class AgentTool(BaseTool):
                 f"Runs the {agent_class.__name__} agent autonomously to completion. "
                 f"Provide a detailed natural language prompt describing the task."
             ),
+            parameters=_AGENT_TOOL_PARAMETERS.copy(),
         )
         # Store via object.__setattr__ to bypass pydantic immutability
         object.__setattr__(self, "agent_class", agent_class)
         object.__setattr__(self, "agent_config", agent_config)
-
-    @property
-    def parameters(self) -> dict:
-        return {
-            "type": "object",
-            "properties": {
-                "prompt": {
-                    "type": "string",
-                    "description": (
-                        "The natural language task description for the agent to execute."
-                    ),
-                }
-            },
-            "required": ["prompt"],
-        }
 
     async def execute(self, prompt: str, **kwargs) -> ToolResult:
         """
@@ -70,7 +85,9 @@ class AgentTool(BaseTool):
         agent_class = object.__getattribute__(self, "agent_class")
         agent_config = object.__getattribute__(self, "agent_config")
 
-        logger.info(f"[AgentTool] Spawning {agent_class.__name__} for prompt: {prompt[:80]}...")
+        logger.info(
+            f"[AgentTool] Spawning {agent_class.__name__} for prompt: {prompt[:80]}..."
+        )
         agent = None
         try:
             # Use async factory .create() if available (e.g., Manus), else direct init
@@ -86,7 +103,9 @@ class AgentTool(BaseTool):
             return ToolResult(output=result)
 
         except Exception as e:
-            logger.error(f"[AgentTool] {agent_class.__name__} failed: {e}", exc_info=True)
+            logger.error(
+                f"[AgentTool] {agent_class.__name__} failed: {e}", exc_info=True
+            )
             return ToolResult(output=f"Agent execution failed: {str(e)}", error=str(e))
 
         finally:
