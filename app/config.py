@@ -233,7 +233,7 @@ class Config:
         with config_path.open("r", encoding="utf-8") as f:
             content = f.read()
         # Replace all ${VAR_NAME} placeholders with environment variable values
-        for placeholder in re.findall(r"\$\{([^}]+)\}", content):
+        for placeholder in re.findall(r"[\\$]\{([^}]+)\}", content):
             env_value = os.getenv(placeholder)
             if env_value is not None:
                 content = content.replace(f"${{{placeholder}}}", env_value)
