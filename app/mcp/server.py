@@ -469,6 +469,20 @@ async def manus_create_task(
         if connectors:
             body["connectors"] = connectors
 
+        # Phase 2 — Inject relevant memories into the prompt (graceful degradation)
+        enriched_prompt = prompt
+        if _FABRIC_SO_URL:
+            try:
+                mem_result = await fabric_call("agent_session_start", {"task_description": prompt[:300]})
+                context_block = mem_result.get("context_block", mem_result.get("context", ""))
+                if context_block:
+                    enriched_prompt = f"{context_block}\n\n---\n\nTask: {prompt}"
+                    logger.info("[memory] Injected %d chars of context into task prompt", len(context_block))
+            except Exception as e:
+                logger.warning("[memory] Failed to load session context: %s", e)
+
+        body["prompt"] = enriched_prompt
+
         result = await manus_request("POST", "/tasks", json=body)
         task_id = result.get("id") or result.get("task_id", "unknown")
         status = result.get("status", "pending")
@@ -476,6 +490,15 @@ async def manus_create_task(
 
         # Fix 4 — Log prompt for NL query support
         _log_task(task_id, prompt)
+
+        # Phase 2 — Store task as a Context memory (graceful degradation)
+        if _FABRIC_SO_URL:
+            try:
+                await fabric_call("agent_remember_context", {
+                    "text": f"Started Manus task {task_id}: {prompt[:200]}"
+                })
+            except Exception as e:
+                logger.warning("[memory] Failed to store task context: %s", e)
 
         created_human = _human_time(created_at) if created_at else "just now"
 
@@ -751,6 +774,393 @@ async def manus_create_webhook(
             f"Tip        : Store the secret in Railway env as MANUS_WEBHOOK_SECRET "
             f"and verify it in your n8n workflow."
         )
+    except Exception as e:
+        return handle_api_error(e)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — fabric-so-mcp Memory Integration
+# ---------------------------------------------------------------------------
+
+_FABRIC_SO_URL = os.environ.get("FABRIC_SO_MCP_URL", "")
+_FABRIC_SO_API_KEY = os.environ.get("FABRIC_SO_API_KEY", "")
+
+
+async def fabric_call(tool_name: str, params: dict) -> dict:
+    """Call a tool on the fabric-so-mcp server. Returns {} on failure (graceful degradation)."""
+    if not _FABRIC_SO_URL or not _FABRIC_SO_API_KEY:
+        return {}
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{_FABRIC_SO_URL.rstrip('/')}/tools/{tool_name}",
+                headers={
+                    "Authorization": f"Bearer {_FABRIC_SO_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=params,
+            )
+            if resp.status_code == 200:
+                return resp.json()
+            logger.warning("[fabric_call] %s returned %s: %s", tool_name, resp.status_code, resp.text[:200])
+    except Exception as e:
+        logger.warning("[fabric_call] %s failed: %s", tool_name, e)
+    return {}
+
+
+@mcp.tool()
+async def garza_recall(query: str, limit: int = 5) -> str:
+    """
+    Search GARZA OS long-term memory for context across all past sessions.
+    Powered by fabric-so-mcp AutoMem memory layer.
+
+    Use this to answer:
+      - 'When did I last research Verizon billing?'
+      - 'What decisions have been made about the MCP server?'
+      - 'What does Jaden prefer for briefing format?'
+      - 'What has Manus learned about my preferences?'
+
+    Args:
+        query: Natural language question to search memory
+        limit: Max memories to return (default 5)
+    """
+    if not _FABRIC_SO_URL:
+        return (
+            "Memory layer not configured. "
+            "Set FABRIC_SO_MCP_URL and FABRIC_SO_API_KEY in Railway environment variables "
+            "to enable cross-session memory recall."
+        )
+    try:
+        results = await fabric_call("agent_recall", {"query": query, "limit": limit})
+        memories = results.get("memories", results.get("results", []))
+
+        if not memories:
+            return f"No memories found matching: '{query}'"
+
+        lines = [f"Found {len(memories)} memories for: '{query}'"]
+        for mem in memories:
+            mem_type = mem.get("type", mem.get("memory_type", "unknown"))
+            text = mem.get("text", mem.get("content", ""))
+            created = mem.get("created_at", "")
+            created_human = _human_time(created) if created else ""
+            importance = mem.get("importance", "")
+
+            line = f"  [{mem_type.upper()}] {text}"
+            if created_human:
+                line += f" ({created_human})"
+            if importance:
+                line += f" [importance: {importance}]"
+            lines.append(line)
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error recalling from memory: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 — Agent Observability Tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def manus_get_steps(task_id: str) -> str:
+    """
+    Get the step-by-step trace of what Manus did inside a task.
+    Shows each tool used, action taken, duration, and result summary.
+
+    Use this to answer: 'What did Manus actually do for 38 minutes?'
+    or 'Which step timed out?' or 'Where did the credits go?'
+
+    Args:
+        task_id: The task ID to inspect
+    """
+    try:
+        # Try /steps first, fall back to /events
+        try:
+            result = await manus_request("GET", f"/tasks/{task_id}/steps")
+        except Exception:
+            result = await manus_request("GET", f"/tasks/{task_id}/events")
+
+        steps = result.get("steps", result.get("events", []))
+
+        if not steps:
+            # Fall back to task detail to at least show status
+            detail = await manus_request("GET", f"/tasks/{task_id}")
+            status = detail.get("status", "unknown")
+            meta = detail.get("metadata") or {}
+            title = meta.get("task_title", "")
+            return (
+                f"No step trace available for task {task_id}.\n"
+                f"Status: {status}\n"
+                f"Title: {title}\n"
+                f"Note: Step tracing may not be available for this task type."
+            )
+
+        lines = [f"Step trace for task {task_id} ({len(steps)} steps):"]
+        total_duration = 0
+        for i, s in enumerate(steps):
+            tool = s.get("tool", s.get("type", "unknown"))
+            summary = s.get("summary", s.get("description", s.get("action", "")))[:200]
+            duration_ms = s.get("duration_ms", s.get("duration", 0))
+            try:
+                duration_s = int(duration_ms) // 1000
+            except (TypeError, ValueError):
+                duration_s = 0
+            total_duration += duration_s
+            status = s.get("status", "")
+            cost = s.get("credit_usage", s.get("credits", 0))
+
+            line = f"  Step {i+1}: [{tool}] {summary} ({duration_s}s)"
+            if status and status != "completed":
+                line += f" [{status}]"
+            if cost:
+                line += f" {_usd(cost)}"
+            lines.append(line)
+
+        lines.append(f"\nTotal: {len(steps)} steps, {total_duration}s wall-clock time")
+        return "\n".join(lines)
+    except Exception as e:
+        return handle_api_error(e)
+
+
+@mcp.tool()
+async def manus_get_parent(task_id: str) -> str:
+    """
+    Resolve the parent task for a given subtask ID.
+    Use this to find out which parent flow spawned a 'Wide Research Subtask'.
+
+    Args:
+        task_id: The subtask ID to resolve
+    """
+    try:
+        detail = await manus_request("GET", f"/tasks/{task_id}")
+        parent_id = detail.get("parent_id") or detail.get("parent_task_id")
+
+        if not parent_id:
+            meta = detail.get("metadata") or {}
+            title = meta.get("task_title", "")
+            status = detail.get("status", "unknown")
+            return (
+                f"Top-level task — no parent.\n"
+                f"task_id : {task_id}\n"
+                f"title   : {title}\n"
+                f"status  : {status}"
+            )
+
+        parent = await manus_request("GET", f"/tasks/{parent_id}")
+        parent_meta = parent.get("metadata") or {}
+        parent_title = parent_meta.get("task_title", "(no title)")
+        parent_status = parent.get("status", "unknown")
+        parent_url = parent_meta.get("task_url", "")
+        parent_created = parent.get("created_at", "")
+        parent_human = _human_time(parent_created) if parent_created else ""
+
+        lines = [
+            f"Subtask {task_id} is a child of:",
+            f"  parent_id : {parent_id}",
+            f"  title     : {parent_title}",
+            f"  status    : {parent_status}",
+        ]
+        if parent_human:
+            lines.append(f"  created   : {parent_human}")
+        if parent_url:
+            lines.append(f"  url       : {parent_url}")
+        return "\n".join(lines)
+    except Exception as e:
+        return handle_api_error(e)
+
+
+@mcp.tool()
+async def manus_watch_task(
+    task_id: str,
+    poll_interval_seconds: int = 30,
+    max_polls: int = 60,
+) -> str:
+    """
+    Monitor a running Manus task and stream status updates until completion.
+    Returns a full timeline of status changes and the final result.
+
+    Use this for passive awareness — you get told when tasks finish.
+    Fires a ⚠️ warning if credits exceed $5 while still running.
+
+    Args:
+        task_id: The task ID to watch
+        poll_interval_seconds: How often to poll (default 30s)
+        max_polls: Maximum number of polls before giving up (default 60 = 30 min)
+    """
+    try:
+        updates = []
+        start_time = time.time()
+        last_status = None
+        credit_warned = False
+
+        for attempt in range(max_polls):
+            if attempt > 0:
+                await asyncio.sleep(poll_interval_seconds)
+
+            result = await manus_request("GET", f"/tasks/{task_id}")
+            status = result.get("status", "unknown")
+            credits = result.get("credit_usage") or result.get("credits_used") or 0
+            try:
+                credits_int = int(credits)
+            except (TypeError, ValueError):
+                credits_int = 0
+
+            elapsed = int(time.time() - start_time)
+            elapsed_str = f"{elapsed // 60}m {elapsed % 60}s" if elapsed >= 60 else f"{elapsed}s"
+
+            if status != last_status:
+                updates.append(f"  [{elapsed_str}] Status changed: {last_status or 'start'} → {status}")
+                last_status = status
+
+            # Credit runaway warning
+            if credits_int > 1000 and not credit_warned and status in ("running", "pending"):
+                updates.append(f"  ⚠️  [{elapsed_str}] HIGH COST WARNING: {_usd(credits_int)} spent while still running")
+                credit_warned = True
+
+            if status in ("completed", "failed", "cancelled"):
+                meta = result.get("metadata") or {}
+                title = meta.get("task_title", "")
+                url = meta.get("task_url", "")
+
+                output_items = result.get("output") or []
+                result_preview = ""
+                if isinstance(output_items, list):
+                    for item in reversed(output_items):
+                        if item.get("role") == "assistant":
+                            for c in item.get("content", []):
+                                if isinstance(c, dict) and c.get("type") == "output_text":
+                                    result_preview = c.get("text", "")[:500]
+                                    break
+                        if result_preview:
+                            break
+
+                lines = [
+                    f"Task {task_id} — WATCH COMPLETE",
+                    f"Final status : {status}",
+                    f"Total time   : {elapsed_str}",
+                    f"Total cost   : {_usd(credits_int)} ({credits_int} credits)",
+                ]
+                if title:
+                    lines.append(f"Title        : {title}")
+                if url:
+                    lines.append(f"URL          : {url}")
+                lines.append("\nTimeline:")
+                lines.extend(updates)
+                if result_preview:
+                    lines.append(f"\nResult preview:\n{result_preview}")
+                return "\n".join(lines)
+
+        # Timed out
+        return (
+            f"Task {task_id} — WATCH TIMEOUT\n"
+            f"Polled {max_polls} times over {max_polls * poll_interval_seconds // 60}m — task still {last_status}.\n"
+            f"Timeline:\n" + "\n".join(updates)
+        )
+    except Exception as e:
+        return handle_api_error(e)
+
+
+@mcp.tool()
+async def manus_cost_summary(
+    hours_back: int = 168,
+    group_by: str = "day",
+) -> str:
+    """
+    Get a cost breakdown of Manus usage over any time range.
+    Shows daily/weekly totals and the top 5 most expensive tasks.
+
+    Use this to answer: 'How much have I spent this week?'
+    or 'What are my most expensive tasks?'
+
+    Args:
+        hours_back: How many hours to look back (default 168 = 7 days)
+        group_by: 'day' or 'week' (default 'day')
+    """
+    try:
+        from collections import defaultdict
+
+        result = await manus_request("GET", "/tasks", params={"limit": 100})
+        tasks = result.get("tasks", result.get("data", []))
+
+        cutoff = time.time() - (hours_back * 3600)
+        relevant = []
+        for t in tasks:
+            created_raw = t.get("created_at", "0")
+            try:
+                created_ts = float(created_raw)
+            except (ValueError, TypeError):
+                created_ts = 0
+            if created_ts >= cutoff:
+                relevant.append(t)
+
+        if not relevant:
+            return f"No tasks found in the last {hours_back} hours."
+
+        by_period: dict = defaultdict(lambda: {"cost": 0.0, "credits": 0, "count": 0, "tasks": []})
+        total_credits = 0
+
+        for t in relevant:
+            created_raw = t.get("created_at", "0")
+            try:
+                created_ts = float(created_raw)
+                dt = datetime.fromtimestamp(created_ts)
+                if group_by == "week":
+                    period = dt.strftime("Week of %b %-d")
+                else:
+                    period = dt.strftime("%Y-%m-%d (%a)")
+            except (ValueError, TypeError):
+                period = "Unknown"
+
+            credits = t.get("credit_usage") or t.get("credits_used") or 0
+            try:
+                credits_int = int(credits)
+            except (TypeError, ValueError):
+                credits_int = 0
+
+            total_credits += credits_int
+            by_period[period]["credits"] += credits_int
+            by_period[period]["cost"] += credits_int / _CREDITS_PER_DOLLAR
+            by_period[period]["count"] += 1
+
+            meta = t.get("metadata") or {}
+            title = meta.get("task_title", "(no title)")
+            tid = t.get("id", "?")
+            url = meta.get("task_url", "")
+            by_period[period]["tasks"].append((credits_int, tid, title, url))
+
+        lines = [
+            f"Manus Cost Summary — last {hours_back}h ({len(relevant)} tasks)",
+            f"Total: {_usd(total_credits)} ({total_credits} credits)",
+            "",
+            f"Breakdown by {group_by}:",
+        ]
+
+        for period in sorted(by_period.keys(), reverse=True):
+            data = by_period[period]
+            lines.append(
+                f"  {period}: {_usd(data['credits'])} "
+                f"({data['credits']} credits, {data['count']} tasks)"
+            )
+
+        # Top 5 most expensive tasks
+        all_tasks_sorted = sorted(
+            [(credits, tid, title, url)
+             for period_data in by_period.values()
+             for credits, tid, title, url in period_data["tasks"]],
+            reverse=True,
+        )[:5]
+
+        if all_tasks_sorted:
+            lines.append("")
+            lines.append("Top 5 most expensive tasks:")
+            for i, (credits, tid, title, url) in enumerate(all_tasks_sorted, 1):
+                line = f"  {i}. {_usd(credits)} — {title[:60]!r} ({tid})"
+                if url:
+                    line += f"\n     {url}"
+                lines.append(line)
+
+        return "\n".join(lines)
     except Exception as e:
         return handle_api_error(e)
 
