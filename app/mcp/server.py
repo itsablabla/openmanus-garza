@@ -1,6 +1,7 @@
 import logging
 import sys
 
+# Configure logging FIRST before any other imports that might trigger config loading
 logging.basicConfig(level=logging.INFO, handlers=[logging.StreamHandler(sys.stderr)])
 
 import argparse
@@ -20,19 +21,12 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 
-from app.logger import logger
-from app.tool.base import BaseTool
-from app.tool.bash import Bash
-from app.tool.browser_use_tool import BrowserUseTool
-from app.tool.str_replace_editor import StrReplaceEditor
-from app.tool.terminate import Terminate
-
-# Agent imports for the high-level agent tools
-from app.agent.manus import Manus
-from app.agent.data_analysis import DataAnalysis
-from app.agent.swe import SWEAgent
-from app.agent.browser import BrowserAgent
-from app.mcp.agent_tool import AgentTool
+# ---------------------------------------------------------------------------
+# NOTE: Heavy imports (app.logger, agents, tools) are deferred to avoid
+# slowing down the Starlette/uvicorn startup. Railway's healthcheck fires
+# within seconds of the process starting, so the /health route must be
+# reachable before any LLM config or agent initialization occurs.
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -65,12 +59,18 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
 
 # ---------------------------------------------------------------------------
-# Health Check
+# Health Check — must be reachable IMMEDIATELY on startup
 # ---------------------------------------------------------------------------
+
+_server_ready = False
 
 async def health_check(request: Request) -> JSONResponse:
     """Simple health endpoint for Railway's deployment checks."""
-    return JSONResponse({"status": "ok", "service": "openmanus-mcp"})
+    return JSONResponse({
+        "status": "ok",
+        "service": "openmanus-mcp",
+        "ready": _server_ready,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -86,12 +86,31 @@ class MCPServer:
          Each spawns a fresh, isolated agent instance per call for full autonomy.
       2. Low-level Primitive Tools — bash, str_replace_editor, terminate
          Direct tool access for callers that need fine-grained control.
+
+    Agent and tool imports are deferred until register_all_tools() is called
+    so that the HTTP server (and /health endpoint) can start immediately.
     """
 
     def __init__(self, name: str = "openmanus"):
         port = int(os.getenv("PORT", os.getenv("FASTMCP_PORT", "8000")))
         self.server = FastMCP(name, port=port)
-        self.tools: Dict[str, BaseTool] = {}
+        self.tools: Dict[str, Any] = {}
+
+    def _load_tools(self) -> None:
+        """Deferred import and instantiation of all tools and agents."""
+        # These imports are slow (LLM config, Playwright, etc.) — keep them here
+        from app.logger import logger as _logger
+        self._logger = _logger
+
+        from app.tool.base import BaseTool
+        from app.tool.bash import Bash
+        from app.tool.str_replace_editor import StrReplaceEditor
+        from app.tool.terminate import Terminate
+        from app.agent.manus import Manus
+        from app.agent.data_analysis import DataAnalysis
+        from app.agent.swe import SWEAgent
+        from app.agent.browser import BrowserAgent
+        from app.mcp.agent_tool import AgentTool
 
         # --- High-level: Agent-as-a-Tool (stateless, isolated per call) ---
         self.tools["run_manus"] = AgentTool(agent_class=Manus)
@@ -104,8 +123,11 @@ class MCPServer:
         self.tools["editor"] = StrReplaceEditor()
         self.tools["terminate"] = Terminate()
 
-    def register_tool(self, tool: BaseTool, method_name: Optional[str] = None) -> None:
+        _logger.info(f"Loaded {len(self.tools)} tools: {list(self.tools.keys())}")
+
+    def register_tool(self, tool: Any, method_name: Optional[str] = None) -> None:
         """Register a tool with parameter validation and documentation."""
+        logger = self._logger
         tool_name = method_name or tool.name
         tool_param = tool.to_param()
         tool_function = tool_param["function"]
@@ -186,9 +208,11 @@ class MCPServer:
         return Signature(parameters=parameters)
 
     async def cleanup(self) -> None:
-        logger.info("Cleaning up server resources")
+        if hasattr(self, "_logger"):
+            self._logger.info("Cleaning up server resources")
 
     def register_all_tools(self) -> None:
+        self._load_tools()
         for tool in self.tools.values():
             self.register_tool(tool)
 
@@ -196,6 +220,7 @@ class MCPServer:
         """
         Build a Starlette app wrapping FastMCP's SSE transport,
         adding the health check route and Bearer auth middleware.
+        The /health route is registered FIRST so it responds immediately.
         """
         # Get the raw Starlette app from FastMCP (has /sse and /messages/ routes)
         fastmcp_app = self.server.sse_app()
@@ -215,23 +240,44 @@ class MCPServer:
 
     def run(self, transport: str = "stdio") -> None:
         """Run the MCP server in the specified transport mode."""
-        self.register_all_tools()
+        global _server_ready
         atexit.register(lambda: asyncio.run(self.cleanup()))
-
-        logger.info(f"Starting OpenManus MCP server ({transport} mode)")
 
         if transport == "sse":
             port = int(os.getenv("PORT", os.getenv("FASTMCP_PORT", "8000")))
             # Always bind to 0.0.0.0 in SSE mode so Railway's load balancer can reach us.
             # FastMCP defaults to 127.0.0.1 which is unreachable from outside the container.
             host = "0.0.0.0"
-            logger.info(f"SSE server listening on {host}:{port}")
-            logger.info(f"  /health  — health check")
-            logger.info(f"  /sse     — MCP endpoint (auth: {'enabled' if os.getenv('MCP_SERVER_AUTH_TOKEN') else 'disabled'})")
-            logger.info(f"  Tools registered: {list(self.tools.keys())}")
+
+            # Build the Starlette app FIRST (fast — no heavy imports yet)
+            # so uvicorn can start serving /health immediately.
             app = self._build_sse_app()
+
+            # Register tools in a background task after the server is up
+            # This ensures /health responds before the slow agent imports complete.
+            async def _startup():
+                global _server_ready
+                import asyncio as _asyncio
+                # Small delay to let uvicorn fully bind the port
+                await _asyncio.sleep(0.5)
+                logging.info("Loading tools and agents in background...")
+                self.register_all_tools()
+                _server_ready = True
+                logging.info(
+                    f"OpenManus MCP server ready on {host}:{port}\n"
+                    f"  /health  — health check\n"
+                    f"  /sse     — MCP endpoint (auth: {'enabled' if os.getenv('MCP_SERVER_AUTH_TOKEN') else 'disabled'})\n"
+                    f"  Tools: {list(self.tools.keys())}"
+                )
+
+            # Add startup event to Starlette app
+            app.add_event_handler("startup", _startup)
+
+            logging.info(f"Starting uvicorn on {host}:{port} ...")
             uvicorn.run(app, host=host, port=port, log_level="info")
         else:
+            # stdio mode — load everything synchronously (no healthcheck needed)
+            self.register_all_tools()
             self.server.run(transport=transport)
 
 
