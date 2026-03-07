@@ -43,6 +43,28 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP("OpenManus Hybrid MCP Server")
 
 # ---------------------------------------------------------------------------
+# Credit → USD conversion
+# Manus pricing: $20/mo = 4,000 credits → $0.005 per credit (½ cent each)
+# ---------------------------------------------------------------------------
+_CREDITS_PER_DOLLAR = 200  # 4000 credits / $20
+
+def _usd(credits: int) -> str:
+    """Convert Manus credits to a human-readable USD string."""
+    if not credits:
+        return ""
+    dollars = credits / _CREDITS_PER_DOLLAR
+    if dollars < 0.01:
+        return f"<$0.01"
+    elif dollars < 1.0:
+        return f"${dollars:.2f}"
+    else:
+        return f"${dollars:.2f}"
+
+def _usd_label(credits: int) -> str:
+    """Return a formatted cost label like '$0.43' or '$7.45'."""
+    return _usd(credits) if credits else ""
+
+# ---------------------------------------------------------------------------
 # Fix 5 — Auth enforcement middleware
 # ---------------------------------------------------------------------------
 
@@ -299,7 +321,7 @@ async def _llm_summarize(query: str, digest_data: dict) -> str:
             if duration:
                 line += f" ({duration})"
             if credits:
-                line += f" — {credits} credits"
+                line += f" — {_usd(credits)}"
             task_lines.append(line)
         
         warnings = digest_data.get("warnings", [])
@@ -307,7 +329,7 @@ async def _llm_summarize(query: str, digest_data: dict) -> str:
         context = f"""Recent Manus AI activity (last {hours}h):
 - Total tasks: {total}
 - Completed: {completed}, Failed: {failed}, Running: {running}
-- Credits used: {total_credits}
+- Cost: {_usd(total_credits)} ({total_credits} credits)
 {chr(10).join(task_lines)}
 {chr(10).join(warnings) if warnings else ''}"""
         
@@ -541,8 +563,8 @@ async def manus_get_task(task_id: str) -> str:
             lines.append(f"updated     : {updated_human}")
         if duration:
             lines.append(f"duration    : {duration}")
-        if credit_usage is not None:
-            lines.append(f"tokens_used : {credit_usage}")
+            if credit_usage is not None:
+                lines.append(f"tokens_used : {credit_usage}")
         if user_prompt:
             lines.append(f"\nYour prompt :\n  {user_prompt}")
         if assistant_result:
@@ -609,7 +631,7 @@ async def manus_list_tasks(
             if duration:
                 line += f"  ({duration})"
             if credit_usage is not None:
-                line += f"  {credit_usage} credits"
+                line += f"  {_usd(credit_usage)}"
             line += f"  {title!r}"
             if prompt_preview and prompt_preview not in title:
                 line += f"  prompt:'{prompt_preview}'"
@@ -824,7 +846,7 @@ async def garza_status(
                         )
                     elif credits_int > _RUNAWAY_CREDITS:
                         warnings.append(
-                            f"⚠️  HIGH CREDIT USAGE: {tid} consumed {credits_int} credits "
+                            f"⚠️  HIGH CREDIT USAGE: {tid} consumed {_usd(credits_int)} ({credits_int} credits) "
                             f"while still running (>{_RUNAWAY_CREDITS} threshold)"
                         )
                 except (ValueError, TypeError):
@@ -862,7 +884,7 @@ async def garza_status(
             if duration:
                 summary += f"  {duration}"
             if credits_int:
-                summary += f"  {credits_int} credits"
+                summary += f"  {_usd(credits_int)}"
             summary += f"\n    Asked: {prompt}"
             if result_preview:
                 summary += f"\n    Result: {result_preview}"
@@ -900,7 +922,7 @@ async def garza_status(
         for s, count in sorted(statuses.items()):
             lines.append(f"  {s:12s}: {count}")
         if total_credits > 0:
-            lines.append(f"  Credits used: {total_credits}")
+            lines.append(f"  Cost: {_usd(total_credits)} ({total_credits} credits)")
 
         if warnings:
             lines.append("")
