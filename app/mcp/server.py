@@ -2204,59 +2204,72 @@ async def garza_fleet_status(
         registry = _registry_load()
         registry_by_task = {e["task_id"]: e for e in registry}
 
-        # 1. Fetch ALL tasks via pagination
+        # 1. Fetch tasks — Manus API only supports limit (max 100), no pagination
+        max_tasks: int = 200  # cap for performance
+        fetch_limit = min(max_tasks, 100)
+        fetch_error = None
         all_tasks = []
-        page = 1
-        page_size = 100
-        while True:
-            try:
-                result = await manus_request("GET", "/tasks", params={"limit": page_size, "page": page})
-            except Exception:
-                break
-            batch = result.get("tasks", result.get("data", []))
-            if not batch:
-                break
-            all_tasks.extend(batch)
-            has_more = result.get("has_more", False) or result.get("hasMore", False)
-            if not has_more or len(batch) < page_size:
-                break
-            page += 1
-            if page > 20:  # safety cap: 2000 tasks max
-                break
+        try:
+            result = await manus_request("GET", "/tasks", params={"limit": fetch_limit})
+            all_tasks = result.get("tasks", result.get("data", []))
+        except Exception as e:
+            fetch_error = str(e)
 
         if not all_tasks:
+            if fetch_error:
+                return f"Fleet status unavailable — API error: {fetch_error}"
             return "No tasks found."
 
         # 2. Classify every task
         classified = []
+        skipped = 0
         for t in all_tasks:
-            state = _classify_task_state(t, now_ts)
-            credits = t.get("credit_usage") or t.get("credits_used") or 0
             try:
-                credits_int = int(credits)
-            except (TypeError, ValueError):
-                credits_int = 0
-            meta = t.get("metadata") or {}
-            title = meta.get("task_title") or t.get("title") or t.get("id", "?")
-            created_raw = t.get("created_at") or 0
-            updated_raw = t.get("updated_at") or created_raw
-            try:
-                created_ts = float(created_raw)
-                updated_ts = float(updated_raw)
-            except (TypeError, ValueError):
-                created_ts = updated_ts = 0
+                state = _classify_task_state(t, now_ts)
+                credits = t.get("credit_usage") or t.get("credits_used") or 0
+                try:
+                    credits_int = int(credits)
+                except (TypeError, ValueError):
+                    credits_int = 0
+                meta = t.get("metadata") or {}
+                title = meta.get("task_title") or t.get("title") or t.get("id", "?")
+                created_raw = t.get("created_at") or 0
+                updated_raw = t.get("updated_at") or created_raw
+                try:
+                    created_ts = float(created_raw)
+                    updated_ts = float(updated_raw)
+                except (TypeError, ValueError):
+                    created_ts = updated_ts = 0
 
-            classified.append({
-                "id": t.get("id", "?"),
-                "title": title,
-                "state": state,
-                "status": t.get("status", "?"),
-                "credits": credits_int,
-                "created_ts": created_ts,
-                "updated_ts": updated_ts,
-                "is_subtask": _is_subtask(t),
-                "registry": registry_by_task.get(t.get("id", ""), {}),
-            })
+                classified.append({
+                    "id": t.get("id", "?"),
+                    "title": title,
+                    "state": state,
+                    "status": t.get("status", "?"),
+                    "credits": credits_int,
+                    "created_ts": created_ts,
+                    "updated_ts": updated_ts,
+                    "is_subtask": _is_subtask(t),
+                    "registry": registry_by_task.get(t.get("id", ""), {}),
+                })
+            except Exception:
+                skipped += 1
+                continue
+
+        # Fallback: if classification failed for all tasks, return raw dump
+        if not classified:
+            lines = [f"Fleet status — raw dump ({len(all_tasks)} tasks, classification failed)"]
+            if skipped:
+                lines.append(f"Skipped {skipped} tasks due to classification errors")
+            for t in all_tasks[:20]:
+                tid = t.get("id", "?")
+                status = t.get("status", "?")
+                meta = t.get("metadata") or {}
+                title = meta.get("task_title") or t.get("title", "")[:50]
+                lines.append(f"  {tid}  [{status}]  {title}")
+            if len(all_tasks) > 20:
+                lines.append(f"  ... and {len(all_tasks)-20} more")
+            return "\n".join(lines)
 
         # 3. Apply filter
         today_cutoff = now_ts - 86400
@@ -2273,6 +2286,19 @@ async def garza_fleet_status(
             show_states = {"active", "stalled", "zombie", "completed", "failed", "unknown"}
 
         visible = [c for c in classified if c["state"] in show_states]
+
+        # If filter returns nothing, give a meaningful message (never empty string)
+        if not visible:
+            total_credits = sum(c["credits"] for c in classified)
+            state_counts = {}
+            for c in classified:
+                state_counts[c["state"]] = state_counts.get(c["state"], 0) + 1
+            counts_str = ", ".join(f"{v} {k}" for k, v in sorted(state_counts.items()))
+            return (
+                f"No tasks match filter '{filter}'. "
+                f"Fleet has {len(classified)} tasks total ({counts_str}). "
+                f"Total spend: {_usd(total_credits)}."
+            )
 
         # 4. Separate named tasks from subtasks
         named = [c for c in visible if not c["is_subtask"]]
