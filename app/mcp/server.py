@@ -428,7 +428,7 @@ async def manus_create_task(
 
     Args:
         prompt: Natural language task description (10-10,000 chars)
-        task_mode: agent (default, full autonomous), adaptive, or chat
+        task_mode: agent (default, full autonomous), adaptive (balanced), or chat (conversational). 'auto' is an alias for 'adaptive'.
         agent_profile: manus-1.6 (default), manus-1.6-lite (fast/cheap), or manus-1.6-max (highest quality)
         file_ids: Comma-separated file IDs from manus_upload_file (optional)
         use_gmail_connector: Grant Manus access to Gmail
@@ -441,9 +441,12 @@ async def manus_create_task(
             "lite": "manus-1.6-lite", "general": "manus-1.6", "default": "manus-1.6"
         }
         api_profile = profile_map.get(agent_profile, agent_profile)
+        # Normalize task_mode aliases — 'auto' is not a valid Manus API value
+        mode_map = {"auto": "adaptive", "autonomous": "agent", "full": "agent", "fast": "adaptive"}
+        api_task_mode = mode_map.get(task_mode.lower(), task_mode)
         body: dict = {
             "prompt": prompt,
-            "taskMode": task_mode,
+            "taskMode": api_task_mode,
             "agentProfile": api_profile,
         }
 
