@@ -1455,7 +1455,7 @@ Analyze this trace and return the JSON diagnosis."""
     payload = {
         "system_instruction": {"parts": [{"text": _DIAGNOSE_SYSTEM}]},
         "contents": [{"role": "user", "parts": [{"text": user_content}]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1024},
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2048, "response_mime_type": "application/json"},
     }
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}"
     try:
@@ -1463,11 +1463,10 @@ Analyze this trace and return the JSON diagnosis."""
         resp.raise_for_status()
         raw = resp.json()
         text = raw["candidates"][0]["content"]["parts"][0]["text"].strip()
-        # Strip markdown code fences if present
+        # Strip markdown code fences if present (regex handles edge cases)
         if text.startswith("```"):
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
+            text = re.sub(r'^```(?:json)?\s*', '', text)
+            text = re.sub(r'\s*```$', '', text)
         return json.loads(text.strip())
     except Exception as exc:
         return {
@@ -1515,7 +1514,7 @@ async def manus_diagnose_task(task_id: str) -> str:
                 content = turn.get("content", [])
                 if isinstance(content, list):
                     for part in content:
-                        if isinstance(part, dict) and part.get("type") == "text":
+                        if isinstance(part, dict) and part.get("type") in ("text", "output_text"):
                             task_prompt = part.get("text", "(unknown)")[:500]
                             break
                 elif isinstance(content, str):
