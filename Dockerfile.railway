@@ -32,6 +32,10 @@ RUN mkdir -p /app/OpenManus/workspace
 # Expose port
 EXPOSE 8000
 
-# Start the web server
-CMD ["python", "server.py"]
+# Copy startup script and make executable
+COPY start.sh /app/OpenManus/start.sh
+RUN chmod +x /app/OpenManus/start.sh
+
+# Start via shell script that patches config before launching Python
+CMD ["/app/OpenManus/start.sh"]
 
