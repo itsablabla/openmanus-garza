@@ -2,9 +2,53 @@
 OpenManus Web Server — Railway Deployment
 Wraps OpenManus with a FastAPI REST API and simple web UI.
 Configured to use CUDOS ASI Cloud inference endpoint.
+
+IMPORTANT: This file patches app/config.py at the TOP before any imports,
+using a self-restart trick to ensure the patch is applied before Python
+loads the module cache.
 """
-import asyncio
 import os
+import sys
+
+# ── STEP 1: Patch app/config.py in-place BEFORE any other imports ──
+# We do this at the very top of the file, before any OpenManus modules load.
+_CONFIG_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app", "config.py")
+
+def _apply_patch():
+    if not os.path.exists(_CONFIG_PY):
+        return False
+    with open(_CONFIG_PY, "r") as f:
+        src = f.read()
+    
+    changed = False
+    
+    # Fix 1: make daytona_api_key optional
+    old1 = "    daytona_api_key: str\n"
+    new1 = "    daytona_api_key: Optional[str] = Field(None, description=\"Daytona API key (optional)\")\n"
+    if old1 in src:
+        src = src.replace(old1, new1)
+        changed = True
+    
+    # Fix 2: skip DaytonaSettings() instantiation when no daytona config
+    old2 = "            daytona_settings = DaytonaSettings()\n"
+    new2 = "            daytona_settings = None  # patched: daytona optional\n"
+    if old2 in src:
+        src = src.replace(old2, new2)
+        changed = True
+    
+    if changed:
+        with open(_CONFIG_PY, "w") as f:
+            f.write(src)
+        print(f"[server.py] Patched {_CONFIG_PY} successfully", flush=True)
+    else:
+        print(f"[server.py] No patch needed (already patched or pattern not found)", flush=True)
+    
+    return changed
+
+_apply_patch()
+
+# ── STEP 2: Now safe to import everything ──
+import asyncio
 import uuid
 from datetime import datetime
 from typing import Optional
@@ -15,51 +59,31 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
-# ── Runtime patch: fix DaytonaSettings BEFORE importing app.config ──
-# Railway may serve a cached build where daytona_api_key is still required.
-# We patch the source file in-place at container startup to make it optional.
-import re as _re
-
-def _patch_daytona_config():
-    """Make DaytonaSettings.daytona_api_key optional at runtime."""
-    config_py = os.path.join(os.path.dirname(__file__), "app", "config.py")
-    if not os.path.exists(config_py):
-        return
-    with open(config_py, "r") as f:
-        src = f.read()
-    # Fix 1: make daytona_api_key optional
-    src = src.replace(
-        "    daytona_api_key: str\n",
-        '    daytona_api_key: Optional[str] = Field(None, description="Daytona API key (optional)")\n'
-    )
-    # Fix 2: don't instantiate DaytonaSettings() with no args when no config
-    src = src.replace(
-        "            daytona_settings = DaytonaSettings()\n",
-        "            daytona_settings = None\n"
-    )
-    with open(config_py, "w") as f:
-        f.write(src)
-
-_patch_daytona_config()
-
-# Patch config to use environment variables for API key
-def _patch_config():
-    """Patch the config to use environment variables for API key."""
-    config_path = os.path.join(os.path.dirname(__file__), "config", "config.toml")
+# Patch the CUDOS API key into config.toml
+def _patch_config_toml():
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "config.toml")
     cudos_key = os.environ.get("CUDOS_API_KEY", "")
     if cudos_key and os.path.exists(config_path):
         with open(config_path, "r") as f:
             content = f.read()
-        content = content.replace("CUDOS_API_KEY", cudos_key)
-        with open(config_path, "w") as f:
-            f.write(content)
+        if "CUDOS_API_KEY" in content:
+            content = content.replace("CUDOS_API_KEY", cudos_key)
+            with open(config_path, "w") as f:
+                f.write(content)
+            print("[server.py] Patched config.toml with CUDOS API key", flush=True)
 
-_patch_config()
+_patch_config_toml()
 
-import app.config as _cfg_module
-
-from app.agent.manus import Manus
-from app.logger import logger
+# Now import OpenManus modules (config.py is already patched)
+try:
+    from app.agent.manus import Manus
+    from app.logger import logger
+    OPENMANUS_AVAILABLE = True
+    print("[server.py] OpenManus loaded successfully", flush=True)
+except Exception as e:
+    print(f"[server.py] WARNING: OpenManus import failed: {e}", flush=True)
+    OPENMANUS_AVAILABLE = False
+    logger = None
 
 app = FastAPI(
     title="OpenManus API",
@@ -98,14 +122,12 @@ async def run_agent_task(task_id: str, prompt: str):
     """Run OpenManus agent in background."""
     tasks[task_id]["status"] = "running"
     try:
+        if not OPENMANUS_AVAILABLE:
+            raise RuntimeError("OpenManus not available — check server logs for import errors")
         agent = await Manus.create()
-        # Capture output
-        import io
-        from contextlib import redirect_stdout
-        output = io.StringIO()
         try:
             await agent.run(prompt)
-            result = f"Task completed successfully. Check workspace directory for outputs."
+            result = "Task completed successfully. Check workspace directory for outputs."
         except Exception as e:
             result = f"Agent error: {str(e)}"
         finally:
@@ -117,7 +139,8 @@ async def run_agent_task(task_id: str, prompt: str):
         tasks[task_id]["status"] = "failed"
         tasks[task_id]["error"] = str(e)
         tasks[task_id]["completed_at"] = datetime.utcnow().isoformat()
-        logger.error(f"Task {task_id} failed: {e}")
+        if logger:
+            logger.error(f"Task {task_id} failed: {e}")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -153,7 +176,6 @@ async def root():
         .status.completed { background: #002a00; color: #00d400; }
         .status.failed { background: #2a0000; color: #ff4444; }
         .result { margin-top: 10px; padding: 10px; background: #0a0a0a; border-radius: 6px; font-size: 0.85rem; color: #aaa; white-space: pre-wrap; }
-        .api-section { margin-top: 8px; }
         code { background: #111; padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 0.85rem; color: #7c8cf8; }
     </style>
 </head>
@@ -165,7 +187,7 @@ async def root():
 
         <div class="card">
             <h2 style="margin-bottom:16px;font-size:1.1rem;">Run a Task</h2>
-            <textarea id="prompt" placeholder="Enter your task for OpenManus... e.g. 'Research the latest AI news and summarize the top 5 stories'"></textarea>
+            <textarea id="prompt" placeholder="Enter your task for OpenManus..."></textarea>
             <br><br>
             <button onclick="submitTask()" id="submitBtn">▶ Run Task</button>
         </div>
@@ -173,91 +195,47 @@ async def root():
         <div class="card">
             <h2 style="margin-bottom:16px;font-size:1.1rem;">Tasks</h2>
             <div class="task-list" id="taskList">
-                <p style="color:#555;font-size:0.9rem;">No tasks yet. Submit a prompt above to get started.</p>
+                <p style="color:#555;font-size:0.9rem;">No tasks yet.</p>
             </div>
         </div>
 
-        <div class="card api-section">
+        <div class="card">
             <h2 style="margin-bottom:12px;font-size:1.1rem;">REST API</h2>
-            <p style="color:#888;font-size:0.9rem;margin-bottom:10px;">Use the API directly for programmatic access:</p>
-            <p><code>POST /tasks</code> — Submit a task with <code>{"prompt": "..."}</code></p>
-            <p style="margin-top:8px;"><code>GET /tasks/{task_id}</code> — Get task status and result</p>
-            <p style="margin-top:8px;"><code>GET /tasks</code> — List all tasks</p>
+            <p><code>POST /tasks</code> — Submit a task</p>
+            <p style="margin-top:8px;"><code>GET /tasks/{task_id}</code> — Get result</p>
             <p style="margin-top:8px;"><code>GET /health</code> — Health check</p>
-            <p style="margin-top:8px;"><a href="/docs" style="color:#7c8cf8;">📖 Interactive API Docs (Swagger)</a></p>
+            <p style="margin-top:8px;"><a href="/docs" style="color:#7c8cf8;">📖 Swagger Docs</a></p>
         </div>
     </div>
 
     <script>
         let pollingIntervals = {};
-
         async function submitTask() {
             const prompt = document.getElementById('prompt').value.trim();
             if (!prompt) return alert('Please enter a prompt');
-            
             const btn = document.getElementById('submitBtn');
-            btn.disabled = true;
-            btn.textContent = '⏳ Submitting...';
-
+            btn.disabled = true; btn.textContent = '⏳ Submitting...';
             try {
-                const res = await fetch('/tasks', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({prompt})
-                });
+                const res = await fetch('/tasks', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({prompt}) });
                 const task = await res.json();
                 document.getElementById('prompt').value = '';
-                renderTask(task);
-                pollTask(task.task_id);
-            } catch(e) {
-                alert('Error: ' + e.message);
-            } finally {
-                btn.disabled = false;
-                btn.textContent = '▶ Run Task';
-            }
+                renderTask(task); pollTask(task.task_id);
+            } catch(e) { alert('Error: ' + e.message); }
+            finally { btn.disabled = false; btn.textContent = '▶ Run Task'; }
         }
-
         function renderTask(task) {
             const list = document.getElementById('taskList');
             const existing = document.getElementById('task-' + task.task_id);
-            const html = `
-                <div class="task-item" id="task-${task.task_id}">
-                    <div class="task-id">${task.task_id}</div>
-                    <div class="task-prompt">${task.prompt}</div>
-                    <span class="status ${task.status}">${task.status}</span>
-                    ${task.result ? '<div class="result">' + task.result + '</div>' : ''}
-                    ${task.error ? '<div class="result" style="color:#ff6666;">' + task.error + '</div>' : ''}
-                </div>`;
-            if (existing) {
-                existing.outerHTML = html;
-            } else {
-                if (list.querySelector('p')) list.innerHTML = '';
-                list.insertAdjacentHTML('afterbegin', html);
-            }
+            const html = `<div class="task-item" id="task-${task.task_id}"><div class="task-id">${task.task_id}</div><div class="task-prompt">${task.prompt}</div><span class="status ${task.status}">${task.status}</span>${task.result ? '<div class="result">'+task.result+'</div>' : ''}${task.error ? '<div class="result" style="color:#ff6666;">'+task.error+'</div>' : ''}</div>`;
+            if (existing) { existing.outerHTML = html; } else { if (list.querySelector('p')) list.innerHTML = ''; list.insertAdjacentHTML('afterbegin', html); }
         }
-
         function pollTask(taskId) {
             if (pollingIntervals[taskId]) return;
             pollingIntervals[taskId] = setInterval(async () => {
-                try {
-                    const res = await fetch('/tasks/' + taskId);
-                    const task = await res.json();
-                    renderTask(task);
-                    if (task.status === 'completed' || task.status === 'failed') {
-                        clearInterval(pollingIntervals[taskId]);
-                        delete pollingIntervals[taskId];
-                    }
-                } catch(e) {}
+                try { const res = await fetch('/tasks/' + taskId); const task = await res.json(); renderTask(task); if (task.status === 'completed' || task.status === 'failed') { clearInterval(pollingIntervals[taskId]); delete pollingIntervals[taskId]; } } catch(e) {}
             }, 3000);
         }
-
-        // Load existing tasks on page load
-        fetch('/tasks').then(r => r.json()).then(tasks => {
-            if (tasks.length > 0) {
-                document.getElementById('taskList').innerHTML = '';
-                tasks.forEach(t => { renderTask(t); if (t.status === 'running' || t.status === 'pending') pollTask(t.task_id); });
-            }
-        });
+        fetch('/tasks').then(r => r.json()).then(tasks => { if (tasks.length > 0) { document.getElementById('taskList').innerHTML = ''; tasks.forEach(t => { renderTask(t); if (t.status === 'running' || t.status === 'pending') pollTask(t.task_id); }); } });
     </script>
 </body>
 </html>
@@ -266,17 +244,8 @@ async def root():
 
 @app.post("/tasks", response_model=TaskResponse)
 async def create_task(request: TaskRequest, background_tasks: BackgroundTasks):
-    """Submit a new task to OpenManus."""
     task_id = request.task_id or str(uuid.uuid4())
-    task = {
-        "task_id": task_id,
-        "status": "pending",
-        "prompt": request.prompt,
-        "result": None,
-        "error": None,
-        "created_at": datetime.utcnow().isoformat(),
-        "completed_at": None,
-    }
+    task = {"task_id": task_id, "status": "pending", "prompt": request.prompt, "result": None, "error": None, "created_at": datetime.utcnow().isoformat(), "completed_at": None}
     tasks[task_id] = task
     background_tasks.add_task(run_agent_task, task_id, request.prompt)
     return TaskResponse(**task)
@@ -284,13 +253,11 @@ async def create_task(request: TaskRequest, background_tasks: BackgroundTasks):
 
 @app.get("/tasks", response_model=list[TaskResponse])
 async def list_tasks():
-    """List all tasks."""
     return [TaskResponse(**t) for t in tasks.values()]
 
 
 @app.get("/tasks/{task_id}", response_model=TaskResponse)
 async def get_task(task_id: str):
-    """Get task status and result."""
     if task_id not in tasks:
         raise HTTPException(status_code=404, detail="Task not found")
     return TaskResponse(**tasks[task_id])
@@ -298,11 +265,11 @@ async def get_task(task_id: str):
 
 @app.get("/health")
 async def health():
-    """Health check endpoint."""
     cudos_key = os.environ.get("CUDOS_API_KEY", "")
     return {
         "status": "healthy",
         "service": "OpenManus",
+        "openmanus_available": OPENMANUS_AVAILABLE,
         "model": "meta-llama/llama-3.3-70b-instruct",
         "inference_provider": "CUDOS ASI Cloud",
         "api_key_configured": bool(cudos_key),
