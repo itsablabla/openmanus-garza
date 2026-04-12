@@ -38,11 +38,11 @@ disable_security = true
 use_data_analysis_agent = false
 EOF
 
-echo "[entrypoint] config.toml written. Starting MCP server (SSE, 0.0.0.0:${PORT:-8000})..."
+echo "[entrypoint] config.toml written. Starting MCP server (Streamable HTTP, 0.0.0.0:${PORT:-8000})..."
 
 # FastMCP reads FASTMCP_HOST and FASTMCP_PORT (prefix: FASTMCP_)
 # Railway provides PORT; forward it so FastMCP binds on the correct port.
 export FASTMCP_HOST="0.0.0.0"
 export FASTMCP_PORT="${PORT:-8000}"
 
-exec python run_mcp_server.py --transport sse
+exec python run_mcp_server.py
